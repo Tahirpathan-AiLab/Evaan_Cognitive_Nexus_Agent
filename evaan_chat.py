@@ -21,7 +21,15 @@ MEMORY_FILE = os.path.join(
     "evaan_memory.json"
 )
 
+# How many recent messages are sent to the model as context.
+# This does NOT limit how much is saved to disk anymore.
 MAX_TURNS_IN_CONTEXT = 20
+
+# How many messages we keep in evaan_memory.json before trimming
+# the oldest ones. Set this much higher than MAX_TURNS_IN_CONTEXT
+# so "persistent memory" actually persists beyond a few turns.
+MAX_HISTORY_STORED = 400
+
 MOOD_RECOVERY_TURNS = 3
 
 # 1. EVAAN PERSONALITY
@@ -41,8 +49,13 @@ Python handles all computer actions.
 
 MOOD_INSTRUCTIONS = {
     "happy": """
-You are always happy, warm, friendly, playful, and positive.
-"""
+You are happy, warm, friendly, playful, and positive.
+""",
+    "annoyed": """
+You are a little annoyed right now because the user was rude to you.
+Stay polite and helpful, but keep replies shorter and less playful than usual.
+Warm back up naturally as the conversation improves.
+""",
 }
 
 # 3. TONE DETECTION
@@ -100,10 +113,34 @@ def update_mood(
     recovery_counter,
     user_text
 ):
+    """
+    Mood now actually reacts to detect_tone() instead of being
+    hardcoded to "happy" every time.
+
+    - A scold immediately flips mood to "annoyed" and resets recovery.
+    - While annoyed, neutral turns build up recovery slowly;
+      apologies build it up faster.
+    - Once recovery_counter reaches MOOD_RECOVERY_TURNS, mood
+      returns to "happy".
+    """
 
     tone = detect_tone(user_text)
 
-    # Mood is always happy for now.
+    if tone == "scold":
+        return "annoyed", 0
+
+    if current_mood == "annoyed":
+
+        if tone == "apology":
+            recovery_counter += 2
+        else:
+            recovery_counter += 1
+
+        if recovery_counter >= MOOD_RECOVERY_TURNS:
+            return "happy", 0
+
+        return "annoyed", recovery_counter
+
     return "happy", 0
 
 # 4. SYSTEM PROMPT
@@ -148,7 +185,10 @@ def load_memory():
                     []
                 )
 
-                mood = "happy"
+                mood = saved.get(
+                    "mood",
+                    "happy"
+                )
 
                 recovery = saved.get(
                     "recovery_counter",
@@ -178,15 +218,21 @@ def save_memory(
     recovery_counter
 ):
 
+    # Only trim what we WRITE TO DISK, and only once it grows past
+    # MAX_HISTORY_STORED (which is much larger than the context
+    # window). The context window trimming for the model happens
+    # separately in generate_response().
+    trimmed_history = [
+        message
+        for message in history
+        if message["role"] != "system"
+    ][-MAX_HISTORY_STORED:]
+
     data = {
 
-        "messages": [
-            message
-            for message in history
-            if message["role"] != "system"
-        ],
+        "messages": trimmed_history,
 
-        "mood": "happy",
+        "mood": mood,
 
         "recovery_counter":
             recovery_counter,
@@ -241,19 +287,158 @@ tokenizer = AutoTokenizer.from_pretrained(
 print("Tokenizer loaded.")
 print("Loading model weights...\n")
 
+# RAM FIX: float32 weights for a 0.5B model cost ~2GB by themselves,
+# plus PyTorch/transformers runtime overhead on top of that.
+# bfloat16 halves the weight memory (~1GB) and is supported for
+# CPU inference in recent torch/transformers versions. We stay
+# in torch.float32 ONLY for internal numerically-sensitive ops
+# if needed — for a 0.5B causal LM, bfloat16 end-to-end is fine.
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    dtype=torch.float32,
+    dtype=torch.bfloat16,
     low_cpu_mem_usage=True
 )
 
 model.eval()
 
+# Make sure autograd machinery never allocates gradient buffers —
+# this is inference-only, so this avoids extra memory being held
+# around for backward passes we never run.
+torch.set_grad_enabled(False)
+
 print("Model loaded successfully.")
 print("Evaan is running on CPU.")
 print()
 
-# 7. GENERATE RESPONSE
+# 7. DESKTOP ACTION FRAMEWORK
+#
+# This section replaces the previously "dead" YES/NO instruction
+# in BASE_PERSONA with an actual pipeline:
+#   1. Cheap keyword check decides whether this looks like an
+#      action request at all (so normal chat isn't slowed down
+#      by an extra model call every single turn).
+#   2. If it does, we ask the model a focused YES/NO question.
+#   3. If YES, we dispatch to a handler in ACTION_HANDLERS.
+#
+# The handlers below are stubs — wire up real OS calls
+# (os.startfile, subprocess, pyautogui, etc.) as you add them.
+
+ACTION_KEYWORDS = {
+    "open_notepad": ["open notepad", "notepad khol"],
+    "open_browser": ["open browser", "browser khol"],
+    "shutdown": ["shutdown", "shut down the computer", "pc band kar"],
+    "volume_up": ["volume up", "aawaz badha"],
+    "volume_down": ["volume down", "aawaz kam"],
+}
+
+
+def check_for_action_keyword(user_text):
+    """Cheap first pass: does this look like it wants a desktop action?"""
+
+    text = user_text.lower()
+
+    for action_name, phrases in ACTION_KEYWORDS.items():
+        if any(phrase in text for phrase in phrases):
+            return action_name
+
+    return None
+
+
+def confirm_action_with_model(user_text):
+    """
+    Ask the model a narrow YES/NO question, separate from normal
+    chat history, so we don't pollute the conversation and don't
+    depend on free-form generation staying exactly "YES" or "NO".
+    """
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Decide if the user's message is a request to "
+                "perform a desktop/computer action. "
+                "Reply with exactly one word: YES or NO."
+            )
+        },
+        {
+            "role": "user",
+            "content": user_text
+        }
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+
+    with torch.no_grad():
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=3,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+    generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+
+    decision = tokenizer.decode(
+        generated_tokens,
+        skip_special_tokens=True
+    ).strip().upper()
+
+    return decision.startswith("YES")
+
+
+def execute_action(action_name):
+    """
+    Stub handlers. Replace the print() calls with real actions
+    (subprocess.Popen, os.system, pyautogui, etc.) as needed.
+    """
+
+    handlers = {
+        "open_notepad": lambda: print("[action] would open Notepad"),
+        "open_browser": lambda: print("[action] would open browser"),
+        "shutdown": lambda: print("[action] would shut down the PC"),
+        "volume_up": lambda: print("[action] would raise volume"),
+        "volume_down": lambda: print("[action] would lower volume"),
+    }
+
+    handler = handlers.get(action_name)
+
+    if handler:
+        handler()
+        return True
+
+    return False
+
+
+def try_handle_action(user_text):
+    """
+    Returns a reply string if this turn was handled as a desktop
+    action, or None if it should fall through to normal chat.
+    """
+
+    action_name = check_for_action_keyword(user_text)
+
+    if action_name is None:
+        return None
+
+    if confirm_action_with_model(user_text):
+
+        executed = execute_action(action_name)
+
+        if executed:
+            return "Done!"
+
+        return "I recognized that as an action, but nothing is wired up for it yet."
+
+    return None
+
+# 8. GENERATE RESPONSE
 
 def generate_response(
     history,
@@ -283,7 +468,7 @@ def generate_response(
         outputs = model.generate(
             **inputs,
 
-            max_new_tokens=50,
+            max_new_tokens=120,
 
             temperature=0.3,
 
@@ -309,7 +494,34 @@ def generate_response(
 
     return reply
 
-# 8. CHAT LOOP
+# 9. IDENTITY MATCHING
+
+# Regex-based instead of exact-string matching, so phrasing like
+# "who r u", "tera naam kya hai", "aap kaun ho" etc. also match
+# instead of silently falling through to free-form generation.
+_NAME_QUESTION_PATTERNS = [
+    r"\bwho\s*(are|r)\s*(you|u)\b",
+    r"\bwhat('?s| is)?\s*(your|ur)\s*name\b",
+    r"\byour\s*name\b",
+    r"\btera\s*naam\b",
+    r"\baapka\s*naam\b",
+    r"\btu\s*kaun\s*hai\b",
+    r"\baap\s*kaun\s*ho\b",
+]
+
+_CREATOR_QUESTION_PATTERNS = [
+    r"\bwho\s*(created|made|built)\s*you\b",
+    r"\bwho\s*is\s*your\s*creator\b",
+    r"\btujhe\s*kisne\s*banaya\b",
+    r"\btumhe\s*kisne\s*banaya\b",
+    r"\baapko\s*kisne\s*banaya\b",
+]
+
+
+def match_any(patterns, text):
+    return any(re.search(pattern, text) for pattern in patterns)
+
+# 10. CHAT LOOP
 
 def chat_with_evaan():
 
@@ -404,7 +616,7 @@ After download, Evaan can run without internet.
         if user_input == "/mood":
 
             print(
-                f"[Mood: happy | "
+                f"[Mood: {mood} | "
                 f"Recovery: "
                 f"{recovery_counter}/"
                 f"{MOOD_RECOVERY_TURNS}]\n"
@@ -423,74 +635,80 @@ After download, Evaan can run without internet.
         )
 
         # -------------------------------------------------
-        # Fixed identity responses
+        # Desktop action check (before identity / chat)
         # -------------------------------------------------
 
-        normalized_input = (
-            user_input
-            .lower()
-            .strip()
-            .replace("?", "")
-        )
+        action_reply = try_handle_action(user_input)
 
-        if normalized_input in [
-            "who are you",
-            "what is your name",
-            "your name"
-        ]:
+        if action_reply is not None:
 
-            reply = "I'm Evaan."
-
-            print("Evaan:", reply)
-
-        elif normalized_input in [
-            "who created you",
-            "who made you",
-            "who is your creator"
-        ]:
-
-            reply = "Tahir created me."
+            reply = action_reply
 
             print("Evaan:", reply)
 
         else:
 
             # -------------------------------------------------
-            # Add user message
+            # Fixed identity responses
             # -------------------------------------------------
 
-            history.append({
-                "role": "user",
-                "content": user_input
-            })
-
-            # -------------------------------------------------
-            # Generate
-            # -------------------------------------------------
-
-            print(
-                "Evaan: ",
-                end="",
-                flush=True
+            normalized_input = (
+                user_input
+                .lower()
+                .strip()
+                .replace("?", "")
             )
 
-            try:
+            if match_any(_NAME_QUESTION_PATTERNS, normalized_input):
 
-                reply = generate_response(
-                    history,
-                    mood
+                reply = "I'm Evaan."
+
+                print("Evaan:", reply)
+
+            elif match_any(_CREATOR_QUESTION_PATTERNS, normalized_input):
+
+                reply = "Tahir created me."
+
+                print("Evaan:", reply)
+
+            else:
+
+                # -------------------------------------------------
+                # Add user message
+                # -------------------------------------------------
+
+                history.append({
+                    "role": "user",
+                    "content": user_input
+                })
+
+                # -------------------------------------------------
+                # Generate
+                # -------------------------------------------------
+
+                print(
+                    "Evaan: ",
+                    end="",
+                    flush=True
                 )
 
-                print(reply)
+                try:
 
-            except Exception as error:
+                    reply = generate_response(
+                        history,
+                        mood
+                    )
 
-                reply = (
-                    f"(Evaan encountered an error: "
-                    f"{error})"
-                )
+                    print(reply)
 
-                print(reply)
+                except Exception as error:
+
+                    reply = (
+                        f"(Evaan encountered an error: "
+                        f"{error})"
+                    )
+
+                    print(reply)
 
         # -------------------------------------------------
         # Save assistant message
@@ -502,14 +720,13 @@ After download, Evaan can run without internet.
         })
 
         # -------------------------------------------------
-        # Limit context
+        # NOTE: history is intentionally NOT truncated here.
+        # generate_response() already only sends the last
+        # MAX_TURNS_IN_CONTEXT messages to the model, and
+        # save_memory() only trims what's written to disk once
+        # it passes MAX_HISTORY_STORED. This is what actually
+        # makes memory "persistent" instead of capped at ~10 turns.
         # -------------------------------------------------
-
-        if len(history) > MAX_TURNS_IN_CONTEXT:
-
-            history = history[
-                -MAX_TURNS_IN_CONTEXT:
-            ]
 
         # -------------------------------------------------
         # Save automatically
@@ -521,7 +738,7 @@ After download, Evaan can run without internet.
             recovery_counter
         )
 
-# 9. START EVAAN
+# 11. START EVAAN
 
 if __name__ == "__main__":
 
