@@ -14,7 +14,7 @@ def remember_turn(user_text, assistant_text):
         infer=False
     )
 
-def get_relevant_memory(query, limit=3):
+def get_relevant_memory(query, limit=3): 
     results = m.search(
     query=query,
     filters={"user_id": USER_ID},

@@ -1,4 +1,4 @@
-# 1. EVAAN PERSONALITY
+# 1. EVAAN PERSONALITY 
 
 BASE_PERSONA = """
 You are Evaan.

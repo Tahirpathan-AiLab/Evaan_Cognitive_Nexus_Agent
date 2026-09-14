@@ -1,7 +1,7 @@
 import re
 
 
-# 3. TONE DETECTION
+# 3. TONE DETECTION 
 
 _SCOLD_PATTERNS = [
     r"\bshut up\b",

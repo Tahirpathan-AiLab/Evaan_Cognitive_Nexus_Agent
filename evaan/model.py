@@ -26,7 +26,7 @@ print("Loading model weights...\n")
 # RAM FIX: float32 weights for a 0.5B model cost ~2GB by themselves,
 # plus PyTorch/transformers runtime overhead on top of that.
 # bfloat16 halves the weight memory (~1GB) and is supported for
-# CPU inference in recent torch/transformers versions. We stay
+# CPU inference in recent torch/transformers versions. We stay 
 # in torch.float32 ONLY for internal numerically-sensitive ops
 # if needed — for a 0.5B causal LM, bfloat16 end-to-end is fine.
 model = AutoModelForCausalLM.from_pretrained(

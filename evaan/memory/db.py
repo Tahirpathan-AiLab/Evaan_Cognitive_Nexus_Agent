@@ -2,7 +2,7 @@ import psycopg2
 from config import DB_CONFIG, MAX_HISTORY_STORED
 
 
-# 5. MEMORY (Postgres-backed)
+# 5. MEMORY (Postgres-backed) 
 
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
